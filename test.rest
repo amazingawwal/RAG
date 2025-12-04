@@ -1,0 +1,7 @@
+POST http://localhost:3000/prompt
+Content-Type: application/json
+
+{
+  "query": "What is AI doing?",
+  "k": 5
+}
