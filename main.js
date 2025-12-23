@@ -11,7 +11,7 @@ const { ChromaClient } = require('chromadb');
 const app = express();
 app.use(express.json());
 
-// Load environment variables
+//Environment variables
 const HF_API_KEY = process.env.HF_API_KEY;
 const EMBED_MODEL_NAME = process.env.EMBED_MODEL_NAME || 'sentence-transformers/all-MiniLM-L6-v2';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
@@ -21,23 +21,24 @@ const RAG_DATA_DIR = process.env.RAG_DATA_DIR || 'uploads/';
 const CHUNK_LENGTH = parseInt(process.env.CHUNK_LENGTH || '150');
 const PORT = process.env.PORT || 3000;
 
-// Initialize clients
+
 const hf = new HfInference(HF_API_KEY);
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 
-// Step 1: Create ChromaDB client
+
+
 let client;
 if (CHROMA_DB_HOST && CHROMA_DB_HOST.trim() !== '') {
-  // Server mode - connect to external ChromaDB server
+  
   client = new ChromaClient({ path: CHROMA_DB_HOST });
   console.log('Using ChromaDB server mode:', CHROMA_DB_HOST);
 } else {
-  // Embedded mode - run ChromaDB in-process
+  
   client = new ChromaClient();
   console.log('Using ChromaDB embedded mode (in-memory)');
 }
 
-// Step 2: Create/get the collection
+
 let collection;
 const COLLECTION_NAME = 'rag_documents';
 
@@ -54,17 +55,17 @@ async function initializeCollection() {
   }
 }
 
-// Ensure upload directory exists
+
 if (!fs.existsSync(RAG_DATA_DIR)) {
   fs.mkdirSync(RAG_DATA_DIR, { recursive: true });
 }
 
-// Configure multer for file uploads
+
 const upload = multer({ dest: RAG_DATA_DIR });
 
-// Semantic chunking function
+
 function semanticChunk(text, targetWords = CHUNK_LENGTH) {
-  // Split by sentences (basic regex for sentence boundaries)
+  
   const sentences = text.split(/(?<=[.!?])\s+/);
   const chunks = [];
   let currentChunk = [];
@@ -75,7 +76,7 @@ function semanticChunk(text, targetWords = CHUNK_LENGTH) {
     const wordCount = words.length;
 
     if (currentWordCount + wordCount > targetWords && currentChunk.length > 0) {
-      // Save current chunk and start new one
+      
       chunks.push(currentChunk.join(' '));
       currentChunk = [sentence];
       currentWordCount = wordCount;
@@ -85,7 +86,7 @@ function semanticChunk(text, targetWords = CHUNK_LENGTH) {
     }
   }
 
-  // Add remaining chunk
+  
   if (currentChunk.length > 0) {
     chunks.push(currentChunk.join(' '));
   }
@@ -93,7 +94,7 @@ function semanticChunk(text, targetWords = CHUNK_LENGTH) {
   return chunks;
 }
 
-// Generate embeddings using HuggingFace
+
 async function generateEmbeddings(texts) {
   try {
     const embeddings = await hf.featureExtraction({
@@ -101,11 +102,11 @@ async function generateEmbeddings(texts) {
       inputs: texts
     });
     
-    // Ensure embeddings is an array of arrays
+    
     if (Array.isArray(embeddings[0])) {
       return embeddings;
     } else {
-      // If single text, wrap in array
+      
       return [embeddings];
     }
   } catch (error) {
@@ -114,7 +115,7 @@ async function generateEmbeddings(texts) {
   }
 }
 
-// Call Gemini LLM for generation with retry logic
+
 async function callGemini(prompt, retries = 3) {
   for (let i = 0; i < retries; i++) {
     try {
@@ -124,9 +125,9 @@ async function callGemini(prompt, retries = 3) {
     } catch (error) {
       console.error(`Error calling Gemini (attempt ${i + 1}/${retries}):`, error.message);
       
-      // Check if it's a rate limit error
+      
       if (error.message && error.message.includes('429')) {
-        // Extract wait time from error message
+        
         const waitMatch = error.message.match(/Please retry in ([\d.]+)s/);
         const waitTime = waitMatch ? Math.ceil(parseFloat(waitMatch[1])) : 60;
         
@@ -142,7 +143,7 @@ async function callGemini(prompt, retries = 3) {
   }
 }
 
-// Upload endpoint - process and index documents
+
 app.post('/upload', upload.array('files'), async (req, res) => {
   try {
     if (!req.files || req.files.length === 0) {
@@ -152,7 +153,7 @@ app.post('/upload', upload.array('files'), async (req, res) => {
     const allChunks = [];
     const context = req.body.context || `ctx-${crypto.randomUUID().slice(0, 8)}`;
 
-    // Process each uploaded file
+    
     for (const file of req.files) {
       try {
         const text = fs.readFileSync(file.path, 'utf-8');
@@ -169,11 +170,11 @@ app.post('/upload', upload.array('files'), async (req, res) => {
           });
         });
 
-        // Clean up uploaded file
+        
         fs.unlinkSync(file.path);
       } catch (error) {
         console.error(`Error processing file ${file.originalname}:`, error);
-        // Clean up file even on error
+        
         if (fs.existsSync(file.path)) {
           fs.unlinkSync(file.path);
         }
@@ -184,10 +185,10 @@ app.post('/upload', upload.array('files'), async (req, res) => {
       return res.status(400).json({ error: 'No valid text chunks extracted from files' });
     }
 
-    // Generate embeddings for all chunks
+    
     const embeddings = await generateEmbeddings(allChunks.map(c => c.text));
 
-    // Step 3: Add embeddings to ChromaDB collection
+    
     const ids = allChunks.map((_, i) => `${context}-${i}-${Date.now()}`);
     const documents = allChunks.map(c => c.text);
     const metadatas = allChunks.map(c => c.metadata);
@@ -212,7 +213,7 @@ app.post('/upload', upload.array('files'), async (req, res) => {
   }
 });
 
-// Prompt endpoint - query the RAG system
+
 app.post('/prompt', async (req, res) => {
   try {
     const { query, k = 5, context = null } = req.body;
@@ -221,16 +222,16 @@ app.post('/prompt', async (req, res) => {
       return res.status(400).json({ error: 'Query is required' });
     }
 
-    // Generate embedding for the query
+    
     const [queryEmbedding] = await generateEmbeddings([query]);
 
-    // Step 4: Query ChromaDB collection
+    
     const queryOptions = {
       queryEmbeddings: [queryEmbedding],
       nResults: k
     };
 
-    // Add context filter if provided
+    
     if (context) {
       queryOptions.where = { context: context };
     }
@@ -244,7 +245,7 @@ app.post('/prompt', async (req, res) => {
       });
     }
 
-    // Format context from retrieved documents
+    
     const contextText = results.documents[0]
       .map((doc, i) => {
         const meta = results.metadatas[0][i];
@@ -252,7 +253,7 @@ app.post('/prompt', async (req, res) => {
       })
       .join('\n\n---\n\n');
 
-    // Create prompt for Gemini
+    
     const prompt = `Use the following context to answer the question. If the answer is not in the context, say so.
 
 Context:
@@ -262,7 +263,7 @@ Question: ${query}
 
 Answer:`;
 
-    // Get answer from Gemini
+    
     const answer = await callGemini(prompt);
 
     res.json({
@@ -280,7 +281,7 @@ Answer:`;
   }
 });
 
-// Rechunk endpoint - re-process documents with new chunk length
+
 app.post('/rechunk', async (req, res) => {
   try {
     const { chunkLength, context = null } = req.body;
@@ -294,7 +295,7 @@ app.post('/rechunk', async (req, res) => {
       return res.status(400).json({ error: 'chunkLength must be a positive number' });
     }
 
-    // Get all existing documents from ChromaDB
+    
     const getOptions = {};
     if (context) {
       getOptions.where = { context: context };
@@ -310,7 +311,6 @@ app.post('/rechunk', async (req, res) => {
       });
     }
 
-    // Group documents by source file
     const fileGroups = {};
     allDocs.documents.forEach((doc, i) => {
       const meta = allDocs.metadatas[i];
@@ -325,18 +325,18 @@ app.post('/rechunk', async (req, res) => {
       fileGroups[key].texts.push(doc);
     });
 
-    // Delete old chunks from ChromaDB
+    
     await collection.delete({
       ids: allDocs.ids
     });
 
-    // Re-chunk and re-index
+    
     const newChunks = [];
     for (const [key, group] of Object.entries(fileGroups)) {
-      // Reconstruct original text (approximate)
+      
       const originalText = group.texts.join(' ');
       
-      // Re-chunk with new length
+      
       const chunks = semanticChunk(originalText, newChunkLength);
 
       chunks.forEach((chunkText, index) => {
@@ -351,10 +351,10 @@ app.post('/rechunk', async (req, res) => {
       });
     }
 
-    // Generate new embeddings
+    
     const embeddings = await generateEmbeddings(newChunks.map(c => c.text));
 
-    // Add back to ChromaDB
+    
     const ids = newChunks.map((_, i) => `rechunk-${i}-${Date.now()}`);
     const documents = newChunks.map(c => c.text);
     const metadatas = newChunks.map(c => c.metadata);
@@ -379,7 +379,7 @@ app.post('/rechunk', async (req, res) => {
   }
 });
 
-// Health check endpoint
+
 app.get('/health', async (req, res) => {
   try {
     const count = await collection.count();
@@ -397,20 +397,20 @@ app.get('/health', async (req, res) => {
   }
 });
 
-// Start server
+
 async function startServer() {
   try {
-    // Initialize ChromaDB collection first
+   
     await initializeCollection();
     
-    // Start Express server
+    
     app.listen(PORT, () => {
-      console.log(`✅ RAG server running on http://localhost:${PORT}`);
-      console.log(`📊 Chunk length: ${CHUNK_LENGTH} words`);
-      console.log(`🤖 Embedding model: ${EMBED_MODEL_NAME}`);
-      console.log(`🧠 LLM model: ${LLM_MODEL_NAME}`);
-      console.log(`💾 Vector store: ChromaDB`);
-      console.log(`📁 Upload directory: ${RAG_DATA_DIR}`);
+      console.log(` RAG server running on http://localhost:${PORT}`);
+      console.log(`Chunk length: ${CHUNK_LENGTH} words`);
+      console.log(`Embedding model: ${EMBED_MODEL_NAME}`);
+      console.log(`LLM model: ${LLM_MODEL_NAME}`);
+      console.log(`Vector store: ChromaDB`);
+      console.log(`Upload directory: ${RAG_DATA_DIR}`);
     });
   } catch (error) {
     console.error('Failed to start server:', error);
