@@ -2,6 +2,7 @@
   "dependencies": {
     "@google/generative-ai": "^0.24.1",
     "@huggingface/inference": "^4.13.4",
+    "chromadb": "^3.1.8",
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
     "multer": "^2.0.2"

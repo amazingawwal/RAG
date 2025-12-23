@@ -3,5 +3,5 @@ Content-Type: application/json
 
 {
   "query": "What is AI doing?",
-  "k": 5
+  "k": 1
 }

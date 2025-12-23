@@ -1,12 +1,12 @@
 require('dotenv').config();
 const express = require('express');
 const multer = require('multer');
-const { spawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { HfInference } = require('@huggingface/inference');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
+const { ChromaClient } = require('chromadb');
 
 const app = express();
 app.use(express.json());
@@ -15,7 +15,8 @@ app.use(express.json());
 const HF_API_KEY = process.env.HF_API_KEY;
 const EMBED_MODEL_NAME = process.env.EMBED_MODEL_NAME || 'sentence-transformers/all-MiniLM-L6-v2';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const LLM_MODEL_NAME = process.env.LLM_MODEL_NAME || 'gemini-2.0-flash-exp';
+const LLM_MODEL_NAME = process.env.LLM_MODEL_NAME || 'gemini-1.5-flash';
+const CHROMA_DB_HOST = process.env.CHROMA_DB_HOST || '';
 const RAG_DATA_DIR = process.env.RAG_DATA_DIR || 'uploads/';
 const CHUNK_LENGTH = parseInt(process.env.CHUNK_LENGTH || '150');
 const PORT = process.env.PORT || 3000;
@@ -24,16 +25,38 @@ const PORT = process.env.PORT || 3000;
 const hf = new HfInference(HF_API_KEY);
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 
-// FAISS paths
-const PY_SCRIPT = path.join(__dirname, 'embeddings_faiss.py');
-const INDEX_DIR = path.join(__dirname, 'index_store');
+// Step 1: Create ChromaDB client
+let client;
+if (CHROMA_DB_HOST && CHROMA_DB_HOST.trim() !== '') {
+  // Server mode - connect to external ChromaDB server
+  client = new ChromaClient({ path: CHROMA_DB_HOST });
+  console.log('Using ChromaDB server mode:', CHROMA_DB_HOST);
+} else {
+  // Embedded mode - run ChromaDB in-process
+  client = new ChromaClient();
+  console.log('Using ChromaDB embedded mode (in-memory)');
+}
 
-// Ensure directories exist
+// Step 2: Create/get the collection
+let collection;
+const COLLECTION_NAME = 'rag_documents';
+
+async function initializeCollection() {
+  try {
+    collection = await client.getOrCreateCollection({
+      name: COLLECTION_NAME,
+      metadata: { 'hnsw:space': 'cosine' }
+    });
+    console.log('✅ ChromaDB collection initialized:', COLLECTION_NAME);
+  } catch (error) {
+    console.error('❌ Error initializing ChromaDB collection:', error.message);
+    throw error;
+  }
+}
+
+// Ensure upload directory exists
 if (!fs.existsSync(RAG_DATA_DIR)) {
   fs.mkdirSync(RAG_DATA_DIR, { recursive: true });
-}
-if (!fs.existsSync(INDEX_DIR)) {
-  fs.mkdirSync(INDEX_DIR, { recursive: true });
 }
 
 // Configure multer for file uploads
@@ -91,15 +114,31 @@ async function generateEmbeddings(texts) {
   }
 }
 
-// Call Gemini LLM for generation
-async function callGemini(prompt) {
-  try {
-    const model = genAI.getGenerativeModel({ model: LLM_MODEL_NAME });
-    const result = await model.generateContent(prompt);
-    return result.response.text();
-  } catch (error) {
-    console.error('Error calling Gemini:', error);
-    throw error;
+// Call Gemini LLM for generation with retry logic
+async function callGemini(prompt, retries = 3) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const model = genAI.getGenerativeModel({ model: LLM_MODEL_NAME });
+      const result = await model.generateContent(prompt);
+      return result.response.text();
+    } catch (error) {
+      console.error(`Error calling Gemini (attempt ${i + 1}/${retries}):`, error.message);
+      
+      // Check if it's a rate limit error
+      if (error.message && error.message.includes('429')) {
+        // Extract wait time from error message
+        const waitMatch = error.message.match(/Please retry in ([\d.]+)s/);
+        const waitTime = waitMatch ? Math.ceil(parseFloat(waitMatch[1])) : 60;
+        
+        if (i < retries - 1) {
+          console.log(`Rate limit hit. Waiting ${waitTime} seconds before retry...`);
+          await new Promise(resolve => setTimeout(resolve, waitTime * 1000));
+          continue;
+        }
+      }
+      
+      throw error;
+    }
   }
 }
 
@@ -111,7 +150,7 @@ app.post('/upload', upload.array('files'), async (req, res) => {
     }
 
     const allChunks = [];
-    const context = req.body.context || `ctx-${crypto.randomUUID().replace(/-/g, '').slice(0, 8)}`;
+    const context = req.body.context || `ctx-${crypto.randomUUID().slice(0, 8)}`;
 
     // Process each uploaded file
     for (const file of req.files) {
@@ -123,11 +162,10 @@ app.post('/upload', upload.array('files'), async (req, res) => {
           allChunks.push({
             text: chunkText,
             metadata: {
-              src: file.originalname,
+              source: file.originalname,
               part: index,
               context: context
-            },
-            context: context
+            }
           });
         });
 
@@ -149,28 +187,21 @@ app.post('/upload', upload.array('files'), async (req, res) => {
     // Generate embeddings for all chunks
     const embeddings = await generateEmbeddings(allChunks.map(c => c.text));
 
-    // Add embeddings to chunks
-    allChunks.forEach((chunk, i) => {
-      chunk.embedding = embeddings[i];
+    // Step 3: Add embeddings to ChromaDB collection
+    const ids = allChunks.map((_, i) => `${context}-${i}-${Date.now()}`);
+    const documents = allChunks.map(c => c.text);
+    const metadatas = allChunks.map(c => c.metadata);
+
+    await collection.add({
+      ids: ids,
+      embeddings: embeddings,
+      documents: documents,
+      metadatas: metadatas
     });
-
-    // Save to FAISS index via Python script
-    const indexFile = path.join(INDEX_DIR, 'to_index.json');
-    fs.writeFileSync(indexFile, JSON.stringify({ chunks: allChunks }));
-
-    // Call FAISS Python script
-    const result = spawnSync('python', [PY_SCRIPT, 'index', indexFile, INDEX_DIR], {
-      encoding: 'utf-8'
-    });
-
-    if (result.status !== 0) {
-      console.error('FAISS indexing error:', result.stderr);
-      return res.status(500).json({ error: 'Failed to index documents', details: result.stderr });
-    }
 
     res.json({
       success: true,
-      message: result.stdout.trim(),
+      message: `Successfully indexed ${allChunks.length} chunks`,
       context: context,
       chunks: allChunks.length
     });
@@ -190,38 +221,23 @@ app.post('/prompt', async (req, res) => {
       return res.status(400).json({ error: 'Query is required' });
     }
 
-    // Check if index exists
-    const indexFile = path.join(INDEX_DIR, 'faiss.index');
-    if (!fs.existsSync(indexFile)) {
-      return res.json({
-        answer: 'No documents have been uploaded yet. Please upload documents first.',
-        retrieved: []
-      });
-    }
-
     // Generate embedding for the query
     const [queryEmbedding] = await generateEmbeddings([query]);
 
-    // Query FAISS via Python script
-    const result = spawnSync(
-      'python',
-      [
-        PY_SCRIPT,
-        'query',
-        JSON.stringify({ embedding: queryEmbedding, k: k, context: context }),
-        INDEX_DIR
-      ],
-      { encoding: 'utf-8' }
-    );
+    // Step 4: Query ChromaDB collection
+    const queryOptions = {
+      queryEmbeddings: [queryEmbedding],
+      nResults: k
+    };
 
-    if (result.status !== 0) {
-      console.error('FAISS query error:', result.stderr);
-      return res.status(500).json({ error: 'Failed to query documents', details: result.stderr });
+    // Add context filter if provided
+    if (context) {
+      queryOptions.where = { context: context };
     }
 
-    const retrieved = JSON.parse(result.stdout);
+    const results = await collection.query(queryOptions);
 
-    if (!retrieved || retrieved.length === 0) {
+    if (!results.documents || !results.documents[0] || results.documents[0].length === 0) {
       return res.json({
         answer: 'No relevant documents found in the knowledge base.',
         retrieved: []
@@ -229,9 +245,10 @@ app.post('/prompt', async (req, res) => {
     }
 
     // Format context from retrieved documents
-    const contextText = retrieved
-      .map((doc) => {
-        return `Source: ${doc.metadata.src}#${doc.metadata.part}\n${doc.text}`;
+    const contextText = results.documents[0]
+      .map((doc, i) => {
+        const meta = results.metadatas[0][i];
+        return `Source: ${meta.source} (Part ${meta.part})\n${doc}`;
       })
       .join('\n\n---\n\n');
 
@@ -250,7 +267,11 @@ Answer:`;
 
     res.json({
       answer: answer,
-      retrieved: retrieved
+      retrieved: results.documents[0].map((doc, i) => ({
+        text: doc,
+        metadata: results.metadatas[0][i],
+        distance: results.distances ? results.distances[0][i] : null
+      }))
     });
 
   } catch (error) {
@@ -273,53 +294,40 @@ app.post('/rechunk', async (req, res) => {
       return res.status(400).json({ error: 'chunkLength must be a positive number' });
     }
 
-    // Check if index exists
-    const metaFile = path.join(INDEX_DIR, 'meta.json');
-    if (!fs.existsSync(metaFile)) {
-      return res.json({
-        success: true,
-        message: 'No documents found to rechunk',
-        chunks: 0
-      });
-    }
-
-    // Read existing metadata
-    const metadata = JSON.parse(fs.readFileSync(metaFile, 'utf-8'));
-
-    if (!metadata || metadata.length === 0) {
-      return res.json({
-        success: true,
-        message: 'No documents found to rechunk',
-        chunks: 0
-      });
-    }
-
-    // Filter by context if provided
-    let documentsToRechunk = metadata;
+    // Get all existing documents from ChromaDB
+    const getOptions = {};
     if (context) {
-      documentsToRechunk = metadata.filter(doc => doc.context === context);
+      getOptions.where = { context: context };
     }
 
-    if (documentsToRechunk.length === 0) {
+    const allDocs = await collection.get(getOptions);
+
+    if (!allDocs.documents || allDocs.documents.length === 0) {
       return res.json({
         success: true,
-        message: 'No documents found with specified context',
+        message: 'No documents found to rechunk',
         chunks: 0
       });
     }
 
     // Group documents by source file
     const fileGroups = {};
-    documentsToRechunk.forEach((doc) => {
-      const key = `${doc.context}-${doc.metadata.src}`;
+    allDocs.documents.forEach((doc, i) => {
+      const meta = allDocs.metadatas[i];
+      const key = `${meta.context}-${meta.source}`;
       if (!fileGroups[key]) {
         fileGroups[key] = {
-          context: doc.context,
-          source: doc.metadata.src,
+          context: meta.context,
+          source: meta.source,
           texts: []
         };
       }
-      fileGroups[key].texts.push(doc.text);
+      fileGroups[key].texts.push(doc);
+    });
+
+    // Delete old chunks from ChromaDB
+    await collection.delete({
+      ids: allDocs.ids
     });
 
     // Re-chunk and re-index
@@ -335,11 +343,10 @@ app.post('/rechunk', async (req, res) => {
         newChunks.push({
           text: chunkText,
           metadata: {
-            src: group.source,
+            source: group.source,
             part: index,
             context: group.context
-          },
-          context: group.context
+          }
         });
       });
     }
@@ -347,29 +354,22 @@ app.post('/rechunk', async (req, res) => {
     // Generate new embeddings
     const embeddings = await generateEmbeddings(newChunks.map(c => c.text));
 
-    // Add embeddings to chunks
-    newChunks.forEach((chunk, i) => {
-      chunk.embedding = embeddings[i];
+    // Add back to ChromaDB
+    const ids = newChunks.map((_, i) => `rechunk-${i}-${Date.now()}`);
+    const documents = newChunks.map(c => c.text);
+    const metadatas = newChunks.map(c => c.metadata);
+
+    await collection.add({
+      ids: ids,
+      embeddings: embeddings,
+      documents: documents,
+      metadatas: metadatas
     });
-
-    // Save to FAISS index via Python script (this will overwrite the existing index)
-    const indexFile = path.join(INDEX_DIR, 'to_index.json');
-    fs.writeFileSync(indexFile, JSON.stringify({ chunks: newChunks }));
-
-    // Call FAISS Python script
-    const result = spawnSync('python', [PY_SCRIPT, 'index', indexFile, INDEX_DIR], {
-      encoding: 'utf-8'
-    });
-
-    if (result.status !== 0) {
-      console.error('FAISS re-indexing error:', result.stderr);
-      return res.status(500).json({ error: 'Failed to re-index documents', details: result.stderr });
-    }
 
     res.json({
       success: true,
       message: `Successfully re-chunked documents with chunk length ${newChunkLength}`,
-      oldChunks: documentsToRechunk.length,
+      oldChunks: allDocs.documents.length,
       newChunks: newChunks.length
     });
 
@@ -380,33 +380,42 @@ app.post('/rechunk', async (req, res) => {
 });
 
 // Health check endpoint
-app.get('/health', (req, res) => {
-  const indexExists = fs.existsSync(path.join(INDEX_DIR, 'faiss.index'));
-  let documentCount = 0;
-  
-  if (indexExists) {
-    try {
-      const metaFile = path.join(INDEX_DIR, 'meta.json');
-      if (fs.existsSync(metaFile)) {
-        const metadata = JSON.parse(fs.readFileSync(metaFile, 'utf-8'));
-        documentCount = metadata.length;
-      }
-    } catch (error) {
-      console.error('Error reading metadata:', error);
-    }
+app.get('/health', async (req, res) => {
+  try {
+    const count = await collection.count();
+    res.json({ 
+      status: 'ok',
+      chromaDB: 'connected',
+      documentsIndexed: count
+    });
+  } catch (error) {
+    res.json({
+      status: 'error',
+      chromaDB: 'disconnected',
+      error: error.message
+    });
   }
-
-  res.json({ 
-    status: 'ok',
-    indexExists: indexExists,
-    documentsIndexed: documentCount
-  });
 });
 
 // Start server
-app.listen(PORT, () => {
-  console.log(` RAG server running on http://localhost:${PORT}`);
-  console.log(` Chunk length: ${CHUNK_LENGTH} words`);
-  console.log(` Embedding model: ${EMBED_MODEL_NAME}`);
-  console.log(` LLM model: ${LLM_MODEL_NAME}`);
-});
+async function startServer() {
+  try {
+    // Initialize ChromaDB collection first
+    await initializeCollection();
+    
+    // Start Express server
+    app.listen(PORT, () => {
+      console.log(`✅ RAG server running on http://localhost:${PORT}`);
+      console.log(`📊 Chunk length: ${CHUNK_LENGTH} words`);
+      console.log(`🤖 Embedding model: ${EMBED_MODEL_NAME}`);
+      console.log(`🧠 LLM model: ${LLM_MODEL_NAME}`);
+      console.log(`💾 Vector store: ChromaDB`);
+      console.log(`📁 Upload directory: ${RAG_DATA_DIR}`);
+    });
+  } catch (error) {
+    console.error('Failed to start server:', error);
+    process.exit(1);
+  }
+}
+
+startServer();
