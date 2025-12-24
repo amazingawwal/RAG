@@ -1,7 +1,22 @@
-POST http://localhost:3000/prompt
+POST http://localhost:3000/chat
 Content-Type: application/json
 
 {
-  "query": "What is AI doing?",
+  "query": "What is customer service?",
   "k": 3
 }
+
+
+###
+POST http://localhost:3000/upload
+Content-Type: multipart/form-data; boundary=boundary
+
+--boundary
+Content-Disposition: form-data; name="files"; filename="test.txt"
+Content-Type: text/plain
+
+./test.txt
+--boundary--
+
+###
+GET http://localhost:3000/health

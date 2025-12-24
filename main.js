@@ -214,7 +214,7 @@ app.post('/upload', upload.array('files'), async (req, res) => {
 });
 
 
-app.post('/prompt', async (req, res) => {
+app.post('/chat', async (req, res) => {
   try {
     const { query, k = 5, context = null } = req.body;
 
