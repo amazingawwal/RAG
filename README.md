@@ -345,7 +345,7 @@ Write-Host "`n✅ All tests completed!" -ForegroundColor Green
    - Regenerates embeddings
    - Updates ChromaDB storage
 
-## 🔧 Configuration
+## Configuration
 
 ### Environment Variables
 
@@ -509,8 +509,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 For issues, questions, or contributions:
 - Open an issue on GitHub
-- Contact: [your-email@example.com]
-- Documentation: [Link to docs]
+- Contact: sakeebmawwal@gmail.com
+
 
 ---
 
