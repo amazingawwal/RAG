@@ -94,26 +94,22 @@ function semanticChunk(text, targetWords = CHUNK_LENGTH) {
   return chunks;
 }
 
+function normalize(vec) {
+  const norm = Math.sqrt(vec.reduce((sum, v) => sum + v * v, 0));
+  return vec.map(v => v / norm);
+}
+
 
 async function generateEmbeddings(texts) {
-  try {
-    const embeddings = await hf.featureExtraction({
-      model: EMBED_MODEL_NAME,
-      inputs: texts
-    });
-    
-    
-    if (Array.isArray(embeddings[0])) {
-      return embeddings;
-    } else {
-      
-      return [embeddings];
-    }
-  } catch (error) {
-    console.error('Error generating embeddings:', error);
-    throw error;
-  }
+  const embeddings = await hf.featureExtraction({
+    model: EMBED_MODEL_NAME,
+    inputs: texts
+  });
+
+  const vectors = Array.isArray(embeddings[0]) ? embeddings : [embeddings];
+  return vectors.map(normalize);
 }
+
 
 
 async function callGemini(prompt, retries = 3) {
