@@ -217,69 +217,68 @@ app.post('/upload', upload.array('files'), async (req, res) => {
 app.post('/chat', async (req, res) => {
   try {
     const { query, k = 5, context = null } = req.body;
-
     if (!query) {
       return res.status(400).json({ error: 'Query is required' });
     }
 
-    
     const [queryEmbedding] = await generateEmbeddings([query]);
 
-    
     const queryOptions = {
       queryEmbeddings: [queryEmbedding],
       nResults: k
     };
 
-    
     if (context) {
-      queryOptions.where = { context: context };
+      queryOptions.where = { context };
     }
 
     const results = await collection.query(queryOptions);
 
-    if (!results.documents || !results.documents[0] || results.documents[0].length === 0) {
-      return res.json({
-        answer: 'No relevant documents found in the knowledge base.',
-        retrieved: []
-      });
+    if (!results.documents?.[0]?.length) {
+      return res.json({ answer: 'No relevant documents found.', retrieved: [] });
     }
 
     
-    const contextText = results.documents[0]
-      .map((doc, i) => {
-        const meta = results.metadatas[0][i];
-        return `Source: ${meta.source} (Part ${meta.part})\n${doc}`;
-      })
-      .join('\n\n---\n\n');
+    const maxDistance = 0.75;
+    const filtered = results.documents[0].map((doc, i) => ({
+      doc,
+      meta: results.metadatas[0][i],
+      distance: results.distances[0][i]
+    })).filter(item => item.distance <= maxDistance);
 
-    
-    const prompt = `Use the following context to answer the question. If the answer is not in the context, say so.
+    if (filtered.length === 0) {
+      return res.json({ answer: 'No relevant documents found.', retrieved: [] });
+    }
+
+    const contextText = filtered.map(item =>
+      `Source: ${item.meta.source} (Part ${item.meta.part})\n${item.doc}`
+    ).join('\n\n---\n\n');
+
+    const prompt = `
+Use the following context to answer the question.
+If the answer is not in the context, say so.
 
 Context:
 ${contextText}
 
 Question: ${query}
 
-Answer:`;
+Answer:
+`;
 
-    
     const answer = await callGemini(prompt);
 
     res.json({
-      answer: answer,
-      retrieved: results.documents[0].map((doc, i) => ({
-        text: doc,
-        metadata: results.metadatas[0][i],
-        distance: results.distances ? results.distances[0][i] : null
-      }))
+      answer,
+      retrieved: filtered
     });
 
   } catch (error) {
-    console.error('Error in /prompt:', error);
+    console.error('Error in /chat:', error);
     res.status(500).json({ error: error.message });
   }
 });
+
 
 
 app.post('/rechunk', async (req, res) => {
