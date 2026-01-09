@@ -235,7 +235,7 @@ app.post('/chat', async (req, res) => {
     }
 
     
-    const maxDistance = 0.75;
+    const maxDistance = 0.95;
     const filtered = results.documents[0].map((doc, i) => ({
       doc,
       meta: results.metadatas[0][i],
